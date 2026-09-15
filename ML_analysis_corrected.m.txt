@@ -1,0 +1,2728 @@
+%% ========================================================================
+%  COMPLETE ML SURROGATE ANALYSIS FOR EXTRACTIVE FERMENTATION
+%
+%  Models:
+%       1. Random Forest
+%       2. SVR-RBF
+%       3. Gaussian Process Regression
+%       4. Weighted Voting Ensemble
+%       5. Leakage-free Stacking Ensemble
+%
+%  Analyses:
+%       - Independent test-set validation
+%       - GPR uncertainty and calibration
+%       - Sobol first-order and total-order sensitivity
+%       - Exact SHAP
+%       - SHAP dependence
+%       - SHAP interaction
+%       - True PDP
+%       - ICE
+%       - RF permutation importance
+%       - Optional optimization uncertainty
+%
+%  Reviewer comments addressed:
+%       R8  - Complete Sobol analysis
+%       R9  - Detailed SHAP analysis
+%       R10 - Correct PDP/ICE interpretation
+%       R11 - Ensemble architecture and leakage-free stacking
+%       R16 - GPR uncertainty and calibration
+%
+% ========================================================================
+
+clear;
+clc;
+close all;
+
+rng(1234,'twister');
+
+fprintf('\n');
+fprintf('============================================================\n');
+fprintf(' ML SURROGATE ANALYSIS\n');
+fprintf('============================================================\n');
+
+
+%% ========================================================================
+% 1. USER SETTINGS
+% ========================================================================
+
+% -------------------------------------------------------------------------
+% DATA FILE
+% -------------------------------------------------------------------------
+
+filename = 'process_data.xlsx';
+
+% Sheet name. Set to 1 if the first sheet should be used.
+sheet_name = 1;
+
+% -------------------------------------------------------------------------
+% DATA STRUCTURE
+% -------------------------------------------------------------------------
+%
+% IMPORTANT:
+%
+% The default assumption is:
+%
+%       Columns 1:3  = input variables
+%       Columns 4:7  = output variables
+%
+% Change these if your Excel file is arranged differently.
+% -------------------------------------------------------------------------
+
+input_columns  = 1:3;
+output_columns = 4:7;
+
+input_names = { ...
+    'Input 1', ...
+    'Input 2', ...
+    'Input 3'};
+
+output_names = { ...
+    'Fermentation product concentration', ...
+    'Solvent-product interaction concentration', ...
+    'Top phase product concentration', ...
+    'Bottom phase product concentration'};
+
+% -------------------------------------------------------------------------
+% DATA SPLIT
+% -------------------------------------------------------------------------
+
+train_fraction = 0.70;
+validation_fraction = 0.15;
+test_fraction = 0.15;
+
+% -------------------------------------------------------------------------
+% RANDOM FOREST
+% -------------------------------------------------------------------------
+
+RF_nTrees = 100;
+
+% -------------------------------------------------------------------------
+% STACKING
+% -------------------------------------------------------------------------
+
+Kfold = 5;
+ridge_lambda = 1e-4;
+
+% -------------------------------------------------------------------------
+% SHAP
+% -------------------------------------------------------------------------
+
+SHAP_background_size = 200;
+SHAP_test_size = 100;
+
+% -------------------------------------------------------------------------
+% SOBOL
+% -------------------------------------------------------------------------
+
+Sobol_N = 20000;
+
+% -------------------------------------------------------------------------
+% PDP / ICE
+% -------------------------------------------------------------------------
+
+N_pdp = 40;
+N_ice = 40;
+
+% To avoid extreme extrapolation in correlated-input regions:
+ICE_percentile = [5 95];
+
+% -------------------------------------------------------------------------
+% GPR UNCERTAINTY
+% -------------------------------------------------------------------------
+
+confidence_level = 0.95;
+z_value = 1.96;
+
+% -------------------------------------------------------------------------
+% FIGURE SETTINGS
+% -------------------------------------------------------------------------
+
+figure_width = 1400;
+figure_height = 850;
+
+results_folder = 'ML_Reviewer_Analysis';
+
+if ~exist(results_folder,'dir')
+    mkdir(results_folder);
+end
+
+
+%% ========================================================================
+% 2. READ DATA
+% ========================================================================
+
+fprintf('\nReading data...\n');
+
+T = readtable(filename,'Sheet',sheet_name);
+
+fprintf('Rows detected: %d\n',height(T));
+fprintf('Columns detected: %d\n',width(T));
+
+% Extract numeric matrix
+data = table2array(T);
+
+% Check numeric data
+if ~isnumeric(data)
+    error(['The selected Excel columns contain nonnumeric data. ', ...
+           'Please ensure all ML input/output columns are numeric.']);
+end
+
+X_all_raw = data(:,input_columns);
+Y_all_raw = data(:,output_columns);
+
+% Remove rows containing NaN or Inf
+valid_rows = all(isfinite(X_all_raw),2) & all(isfinite(Y_all_raw),2);
+
+X_all_raw = X_all_raw(valid_rows,:);
+Y_all_raw = Y_all_raw(valid_rows,:);
+
+fprintf('Valid observations: %d\n',size(X_all_raw,1));
+
+n_samples = size(X_all_raw,1);
+n_inputs = size(X_all_raw,2);
+n_outputs = size(Y_all_raw,2);
+
+if n_inputs ~= numel(input_names)
+    error('Number of input names does not match number of input columns.');
+end
+
+if n_outputs ~= numel(output_names)
+    error('Number of output names does not match number of output columns.');
+end
+
+
+%% ========================================================================
+% 3. TRAIN / VALIDATION / TEST SPLIT
+% ========================================================================
+
+fprintf('\nCreating train/validation/test split...\n');
+
+cv1 = cvpartition(n_samples,'HoldOut',test_fraction);
+
+idx_test = test(cv1);
+idx_remaining = training(cv1);
+
+remaining_indices = find(idx_remaining);
+
+validation_relative = validation_fraction / ...
+    (train_fraction + validation_fraction);
+
+cv2 = cvpartition(numel(remaining_indices),...
+                  'HoldOut',validation_relative);
+
+idx_val_temp = test(cv2);
+idx_train_temp = training(cv2);
+
+idx_train = false(n_samples,1);
+idx_val = false(n_samples,1);
+
+idx_train(remaining_indices(idx_train_temp)) = true;
+idx_val(remaining_indices(idx_val_temp)) = true;
+
+X_train_raw = X_all_raw(idx_train,:);
+X_val_raw   = X_all_raw(idx_val,:);
+X_test_raw  = X_all_raw(idx_test,:);
+
+Y_train_raw = Y_all_raw(idx_train,:);
+Y_val_raw   = Y_all_raw(idx_val,:);
+Y_test_raw  = Y_all_raw(idx_test,:);
+
+fprintf('Training observations   : %d\n',size(X_train_raw,1));
+fprintf('Validation observations : %d\n',size(X_val_raw,1));
+fprintf('Test observations       : %d\n',size(X_test_raw,1));
+
+
+%% ========================================================================
+% 4. TRAINING-ONLY MIN-MAX NORMALIZATION
+% ========================================================================
+
+fprintf('\nApplying training-only normalization...\n');
+
+% -------------------------------------------------------------------------
+% INPUT NORMALIZATION
+% -------------------------------------------------------------------------
+
+X_min = min(X_train_raw,[],1);
+X_max = max(X_train_raw,[],1);
+
+X_range = X_max - X_min;
+
+% Avoid division by zero
+X_range(X_range == 0) = 1;
+
+X_train = (X_train_raw - X_min) ./ X_range;
+X_val   = (X_val_raw   - X_min) ./ X_range;
+X_test  = (X_test_raw  - X_min) ./ X_range;
+
+% -------------------------------------------------------------------------
+% OUTPUT NORMALIZATION
+% -------------------------------------------------------------------------
+
+Y_min = min(Y_train_raw,[],1);
+Y_max = max(Y_train_raw,[],1);
+
+Y_range = Y_max - Y_min;
+
+Y_range(Y_range == 0) = 1;
+
+Y_train = (Y_train_raw - Y_min) ./ Y_range;
+Y_val   = (Y_val_raw   - Y_min) ./ Y_range;
+Y_test  = (Y_test_raw  - Y_min) ./ Y_range;
+
+fprintf('Normalization completed.\n');
+
+
+%% ========================================================================
+% 5. NORMALIZATION DIAGNOSTIC
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' NORMALIZATION DIAGNOSTIC\n');
+fprintf('============================================================\n');
+
+for j = 1:n_outputs
+
+    fprintf('\nOutput: %s\n',output_names{j});
+
+    fprintf('Physical minimum : %.10f\n',Y_min(j));
+    fprintf('Physical maximum : %.10f\n',Y_max(j));
+    fprintf('Physical range   : %.10f\n',Y_range(j));
+
+    fprintf('Normalized training range: %.6f to %.6f\n',...
+        min(Y_train(:,j)),max(Y_train(:,j)));
+
+end
+
+
+%% ========================================================================
+% 6. TRAIN BASE MODELS
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' TRAINING BASE MODELS\n');
+fprintf('============================================================\n');
+
+RF_models  = cell(n_outputs,1);
+SVR_models = cell(n_outputs,1);
+GPR_models = cell(n_outputs,1);
+
+for out = 1:n_outputs
+
+    fprintf('\nTraining output %d/%d: %s\n',...
+        out,n_outputs,output_names{out});
+
+    % ---------------------------------------------------------------------
+    % RANDOM FOREST / BAGGED REGRESSION TREES
+    % ---------------------------------------------------------------------
+
+    RF_models{out} = fitrensemble( ...
+        X_train,...
+        Y_train(:,out),...
+        'Method','Bag',...
+        'NumLearningCycles',RF_nTrees);
+
+    % ---------------------------------------------------------------------
+    % SVR WITH RBF KERNEL
+    % ---------------------------------------------------------------------
+
+    SVR_models{out} = fitrsvm( ...
+        X_train,...
+        Y_train(:,out),...
+        'KernelFunction','rbf',...
+        'Standardize',true);
+
+    % ---------------------------------------------------------------------
+    % GAUSSIAN PROCESS REGRESSION
+    % ---------------------------------------------------------------------
+
+    GPR_models{out} = fitrgp( ...
+        X_train,...
+        Y_train(:,out),...
+        'KernelFunction','squaredexponential',...
+        'Standardize',true);
+
+end
+
+fprintf('\nAll base models trained successfully.\n');
+
+
+%% ========================================================================
+% 7. BASE MODEL PREDICTIONS
+% ========================================================================
+
+fprintf('\nGenerating predictions...\n');
+
+RF_pred_train  = zeros(size(Y_train));
+RF_pred_val    = zeros(size(Y_val));
+RF_pred_test   = zeros(size(Y_test));
+
+SVR_pred_train = zeros(size(Y_train));
+SVR_pred_val   = zeros(size(Y_val));
+SVR_pred_test  = zeros(size(Y_test));
+
+GPR_pred_train = zeros(size(Y_train));
+GPR_pred_val   = zeros(size(Y_val));
+GPR_pred_test  = zeros(size(Y_test));
+
+for out = 1:n_outputs
+
+    RF_pred_train(:,out) = predict(RF_models{out},X_train);
+    RF_pred_val(:,out)   = predict(RF_models{out},X_val);
+    RF_pred_test(:,out)  = predict(RF_models{out},X_test);
+
+    SVR_pred_train(:,out) = predict(SVR_models{out},X_train);
+    SVR_pred_val(:,out)   = predict(SVR_models{out},X_val);
+    SVR_pred_test(:,out)  = predict(SVR_models{out},X_test);
+
+    GPR_pred_train(:,out) = predict(GPR_models{out},X_train);
+    GPR_pred_val(:,out)   = predict(GPR_models{out},X_val);
+    GPR_pred_test(:,out)  = predict(GPR_models{out},X_test);
+
+end
+
+
+%% ========================================================================
+% 8. MODEL METRICS
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' INDEPENDENT TEST-SET MODEL PERFORMANCE\n');
+fprintf('============================================================\n');
+
+models = {'RF','SVR','GPR'};
+
+BaseMetrics = struct();
+
+for out = 1:n_outputs
+
+    fprintf('\n------------------------------------------------------------\n');
+    fprintf('%s\n',output_names{out});
+    fprintf('------------------------------------------------------------\n');
+
+    pred_cell = { ...
+        RF_pred_test(:,out),...
+        SVR_pred_test(:,out),...
+        GPR_pred_test(:,out)};
+
+    for m = 1:3
+
+        pred_norm = pred_cell{m};
+        true_norm = Y_test(:,out);
+
+        R2 = 1 - sum((true_norm-pred_norm).^2) / ...
+            sum((true_norm-mean(true_norm)).^2);
+
+        RMSE_norm = sqrt(mean((true_norm-pred_norm).^2));
+        MAE_norm  = mean(abs(true_norm-pred_norm));
+
+        % Convert prediction to physical units
+        pred_phys = pred_norm .* Y_range(out) + Y_min(out);
+        true_phys = Y_test_raw(:,out);
+
+        RMSE_phys = sqrt(mean((true_phys-pred_phys).^2));
+        MAE_phys  = mean(abs(true_phys-pred_phys));
+
+        BaseMetrics.(models{m}).R2(out) = R2;
+        BaseMetrics.(models{m}).RMSE_norm(out) = RMSE_norm;
+        BaseMetrics.(models{m}).MAE_norm(out) = MAE_norm;
+        BaseMetrics.(models{m}).RMSE_phys(out) = RMSE_phys;
+        BaseMetrics.(models{m}).MAE_phys(out) = MAE_phys;
+
+        fprintf('%s: R2 = %.5f | RMSE(norm) = %.5f | MAE(norm) = %.5f | RMSE(phys) = %.5f | MAE(phys) = %.5f\n',...
+            models{m},R2,RMSE_norm,MAE_norm,RMSE_phys,MAE_phys);
+
+    end
+
+end
+
+
+%% ========================================================================
+% 9. WEIGHTED VOTING ENSEMBLE
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' WEIGHTED VOTING ENSEMBLE\n');
+fprintf('============================================================\n');
+
+VotingWeights = zeros(n_outputs,3);
+
+Voting_pred_val  = zeros(size(Y_val));
+Voting_pred_test = zeros(size(Y_test));
+
+for out = 1:n_outputs
+
+    rmse_RF = sqrt(mean((Y_val(:,out)-RF_pred_val(:,out)).^2));
+    rmse_SVR = sqrt(mean((Y_val(:,out)-SVR_pred_val(:,out)).^2));
+    rmse_GPR = sqrt(mean((Y_val(:,out)-GPR_pred_val(:,out)).^2));
+
+    inv_rmse = 1 ./ [rmse_RF,rmse_SVR,rmse_GPR];
+
+    weights = inv_rmse ./ sum(inv_rmse);
+
+    VotingWeights(out,:) = weights;
+
+    fprintf('\n%s\n',output_names{out});
+    fprintf('RF  weight = %.4f\n',weights(1));
+    fprintf('SVR weight = %.4f\n',weights(2));
+    fprintf('GPR weight = %.4f\n',weights(3));
+
+    Voting_pred_val(:,out) = ...
+        weights(1)*RF_pred_val(:,out) + ...
+        weights(2)*SVR_pred_val(:,out) + ...
+        weights(3)*GPR_pred_val(:,out);
+
+    Voting_pred_test(:,out) = ...
+        weights(1)*RF_pred_test(:,out) + ...
+        weights(2)*SVR_pred_test(:,out) + ...
+        weights(3)*GPR_pred_test(:,out);
+
+end
+
+
+%% ========================================================================
+% 10. LEAKAGE-FREE STACKING ENSEMBLE
+% ========================================================================
+%
+% IMPORTANT:
+%
+% The meta learner is trained ONLY on out-of-fold predictions.
+% Therefore, the final test set is never used to train the meta learner.
+%
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' LEAKAGE-FREE STACKING ENSEMBLE\n');
+fprintf('============================================================\n');
+
+Stacking_models = cell(n_outputs,1);
+Stacking_pred_test = zeros(size(Y_test));
+
+Stacking_Beta = zeros(n_inputs*0+3,n_outputs);
+Stacking_Bias = zeros(n_outputs,1);
+
+for out = 1:n_outputs
+
+    fprintf('\nStacking output: %s\n',output_names{out});
+
+    cv = cvpartition(size(X_train,1),'KFold',Kfold);
+
+    OOF_predictions = zeros(size(X_train,1),3);
+
+    for fold = 1:Kfold
+
+        train_fold = training(cv,fold);
+        val_fold   = test(cv,fold);
+
+        Xtr = X_train(train_fold,:);
+        ytr = Y_train(train_fold,out);
+
+        Xva = X_train(val_fold,:);
+
+        % RF
+        mdl_RF = fitrensemble( ...
+            Xtr,ytr,...
+            'Method','Bag',...
+            'NumLearningCycles',RF_nTrees);
+
+        % SVR
+        mdl_SVR = fitrsvm( ...
+            Xtr,ytr,...
+            'KernelFunction','rbf',...
+            'Standardize',true);
+
+        % GPR
+        mdl_GPR = fitrgp( ...
+            Xtr,ytr,...
+            'KernelFunction','squaredexponential',...
+            'Standardize',true);
+
+        OOF_predictions(val_fold,1) = predict(mdl_RF,Xva);
+        OOF_predictions(val_fold,2) = predict(mdl_SVR,Xva);
+        OOF_predictions(val_fold,3) = predict(mdl_GPR,Xva);
+
+    end
+
+    % ---------------------------------------------------------------------
+    % RIDGE META-LEARNER
+    % ---------------------------------------------------------------------
+
+    Stacking_models{out} = fitrlinear( ...
+        OOF_predictions,...
+        Y_train(:,out),...
+        'Learner','leastsquares',...
+        'Regularization','ridge',...
+        'Lambda',ridge_lambda);
+
+    % Final test prediction from base models trained on complete training set
+    test_base_predictions = [ ...
+        RF_pred_test(:,out),...
+        SVR_pred_test(:,out),...
+        GPR_pred_test(:,out)];
+
+    Stacking_pred_test(:,out) = ...
+        predict(Stacking_models{out},test_base_predictions);
+
+    % Meta learner coefficients
+    try
+        Stacking_Beta(:,out) = Stacking_models{out}.Beta;
+        Stacking_Bias(out) = Stacking_models{out}.Bias;
+    catch
+        fprintf('Could not directly extract stacking coefficients.\n');
+    end
+
+end
+
+
+%% ========================================================================
+% 11. STACKING METRICS
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' STACKING TEST PERFORMANCE\n');
+fprintf('============================================================\n');
+
+StackingMetrics = struct();
+
+for out = 1:n_outputs
+
+    true_norm = Y_test(:,out);
+    pred_norm = Stacking_pred_test(:,out);
+
+    R2 = 1 - sum((true_norm-pred_norm).^2) / ...
+        sum((true_norm-mean(true_norm)).^2);
+
+    RMSE_norm = sqrt(mean((true_norm-pred_norm).^2));
+    MAE_norm = mean(abs(true_norm-pred_norm));
+
+    true_phys = Y_test_raw(:,out);
+    pred_phys = pred_norm .* Y_range(out) + Y_min(out);
+
+    RMSE_phys = sqrt(mean((true_phys-pred_phys).^2));
+    MAE_phys = mean(abs(true_phys-pred_phys));
+
+    StackingMetrics.R2(out) = R2;
+    StackingMetrics.RMSE_norm(out) = RMSE_norm;
+    StackingMetrics.MAE_norm(out) = MAE_norm;
+    StackingMetrics.RMSE_phys(out) = RMSE_phys;
+    StackingMetrics.MAE_phys(out) = MAE_phys;
+
+    fprintf('%s: R2 = %.5f | RMSE = %.5f | MAE = %.5f\n',...
+        output_names{out},R2,RMSE_phys,MAE_phys);
+
+end
+
+
+%% ========================================================================
+% 12. FIGURE 2 — MODEL AND ENSEMBLE PERFORMANCE
+% ========================================================================
+
+figure('Color','w',...
+       'Position',[100 100 figure_width figure_height]);
+
+tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+for out = 1:n_outputs
+
+    nexttile;
+
+    R2_values = [ ...
+        BaseMetrics.RF.R2(out),...
+        BaseMetrics.SVR.R2(out),...
+        BaseMetrics.GPR.R2(out),...
+        StackingMetrics.R2(out)];
+
+    bar(R2_values);
+
+    ylim([0 1.05]);
+
+    set(gca,...
+        'XTick',1:4,...
+        'XTickLabel',{'RF','SVR','GPR','Stacking'});
+
+    ylabel('Independent test-set R^2');
+
+    title(output_names{out},'Interpreter','none');
+
+    grid on;
+    box on;
+
+end
+
+sgtitle('Independent test-set performance of base and ensemble models',...
+        'FontWeight','bold');
+
+save_myfig(gcf,'Figure_2_Model_Performance');
+
+
+%% ========================================================================
+% 13. SUPPLEMENTARY FIGURES S1-S3 — ACTUAL VS PREDICTED
+% ========================================================================
+
+for m = 1:3
+
+    switch m
+
+        case 1
+            pred_matrix = RF_pred_test;
+            model_name = 'Random Forest';
+
+        case 2
+            pred_matrix = SVR_pred_test;
+            model_name = 'SVR-RBF';
+
+        case 3
+            pred_matrix = GPR_pred_test;
+            model_name = 'GPR';
+
+    end
+
+    figure('Color','w',...
+        'Position',[100 100 figure_width figure_height]);
+
+    tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+    for out = 1:n_outputs
+
+        nexttile;
+
+        pred_phys = pred_matrix(:,out).*Y_range(out)+Y_min(out);
+        actual_phys = Y_test_raw(:,out);
+
+        scatter(actual_phys,pred_phys,35,'filled');
+
+        hold on;
+
+        mn = min([actual_phys;pred_phys]);
+        mx = max([actual_phys;pred_phys]);
+
+        plot([mn mx],[mn mx],'k--','LineWidth',1.5);
+
+        xlabel('Measured output');
+        ylabel('Predicted output');
+
+        title(output_names{out},'Interpreter','none');
+
+        grid on;
+        box on;
+
+    end
+
+    sgtitle(sprintf('%s — independent test-set predictions',model_name),...
+        'FontWeight','bold');
+
+    save_myfig(gcf,sprintf('S%d_%s_Actual_vs_Predicted',...
+        m,strrep(model_name,'-','_')));
+
+end
+
+
+%% ========================================================================
+% 14. GPR HYPERPARAMETERS
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' GPR HYPERPARAMETERS\n');
+fprintf('============================================================\n');
+
+GPR_Hyperparameters = table( ...
+    'Size',[n_outputs 4],...
+    'VariableTypes',{'string','double','double','double'},...
+    'VariableNames',{'Output','KernelParameter1',...
+                     'KernelParameter2','Sigma'});
+
+for out = 1:n_outputs
+
+    mdl = GPR_models{out};
+
+    GPR_Hyperparameters.Output(out) = string(output_names{out});
+
+    try
+        kp = mdl.KernelInformation.KernelParameters;
+
+        if numel(kp) >= 1
+            GPR_Hyperparameters.KernelParameter1(out) = kp(1);
+        end
+
+        if numel(kp) >= 2
+            GPR_Hyperparameters.KernelParameter2(out) = kp(2);
+        end
+
+    catch
+    end
+
+    try
+        GPR_Hyperparameters.Sigma(out) = mdl.Sigma;
+    catch
+    end
+
+    fprintf('%s:\n',output_names{out});
+    fprintf('  Kernel parameter 1 = %.12g\n',...
+        GPR_Hyperparameters.KernelParameter1(out));
+    fprintf('  Kernel parameter 2 = %.12g\n',...
+        GPR_Hyperparameters.KernelParameter2(out));
+    fprintf('  Sigma               = %.12g\n',...
+        GPR_Hyperparameters.Sigma(out));
+
+end
+
+
+%% ========================================================================
+% 15. GPR INDEPENDENT TEST UNCERTAINTY
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' GPR INDEPENDENT TEST UNCERTAINTY\n');
+fprintf('============================================================\n');
+
+GPR_Uncertainty = struct();
+
+for out = 1:n_outputs
+
+    mdl = GPR_models{out};
+
+    [mu_norm,sd_norm] = predict(mdl,X_test);
+
+    lower_norm = mu_norm - z_value*sd_norm;
+    upper_norm = mu_norm + z_value*sd_norm;
+
+    % Convert all to physical units
+    mu_phys = mu_norm.*Y_range(out)+Y_min(out);
+
+    lower_phys = lower_norm.*Y_range(out)+Y_min(out);
+    upper_phys = upper_norm.*Y_range(out)+Y_min(out);
+
+    actual_phys = Y_test_raw(:,out);
+
+    covered = actual_phys >= lower_phys & ...
+              actual_phys <= upper_phys;
+
+    coverage = mean(covered);
+
+    PI_width_norm = mean(upper_norm-lower_norm);
+    PI_width_phys = mean(upper_phys-lower_phys);
+
+    GPR_Uncertainty(out).output = output_names{out};
+    GPR_Uncertainty(out).mu_norm = mu_norm;
+    GPR_Uncertainty(out).sd_norm = sd_norm;
+    GPR_Uncertainty(out).lower_norm = lower_norm;
+    GPR_Uncertainty(out).upper_norm = upper_norm;
+    GPR_Uncertainty(out).mu_phys = mu_phys;
+    GPR_Uncertainty(out).lower_phys = lower_phys;
+    GPR_Uncertainty(out).upper_phys = upper_phys;
+    GPR_Uncertainty(out).coverage = coverage;
+    GPR_Uncertainty(out).PI_width_norm = PI_width_norm;
+    GPR_Uncertainty(out).PI_width_phys = PI_width_phys;
+
+    fprintf('\n%s\n',output_names{out});
+    fprintf('95%% PI coverage       = %.2f %%\n',100*coverage);
+    fprintf('Mean PI width (norm)  = %.6f\n',PI_width_norm);
+    fprintf('Mean PI width (phys)  = %.6f\n',PI_width_phys);
+
+    if coverage < 0.90
+
+        fprintf(['WARNING: Empirical 95%% coverage is substantially ',...
+                 'below nominal coverage.\n']);
+
+    end
+
+end
+
+
+%% ========================================================================
+% 16. FIGURE 7 — GPR PREDICTION INTERVALS
+% ========================================================================
+
+figure('Color','w',...
+       'Position',[100 100 figure_width figure_height]);
+
+tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+for out = 1:n_outputs
+
+    nexttile;
+
+    actual = Y_test_raw(:,out);
+
+    [actual_sorted,idx] = sort(actual);
+
+    mu = GPR_Uncertainty(out).mu_phys(idx);
+    lo = GPR_Uncertainty(out).lower_phys(idx);
+    hi = GPR_Uncertainty(out).upper_phys(idx);
+
+    x_axis = actual_sorted;
+
+    hold on;
+
+    fill([x_axis;flipud(x_axis)],...
+         [lo;flipud(hi)],...
+         [0.85 0.85 0.85],...
+         'EdgeColor','none');
+
+    plot(x_axis,mu,'k-','LineWidth',1.8);
+
+    plot(x_axis,x_axis,'k--','LineWidth',1.2);
+
+    xlabel('Measured output');
+    ylabel('GPR prediction / 95% PI');
+
+    title(sprintf('%s (coverage = %.1f%%)',...
+        output_names{out},...
+        100*GPR_Uncertainty(out).coverage),...
+        'Interpreter','none');
+
+    grid on;
+    box on;
+
+end
+
+sgtitle('GPR predictive uncertainty on the independent test set',...
+        'FontWeight','bold');
+
+save_myfig(gcf,'Figure_7_GPR_Uncertainty');
+
+
+%% ========================================================================
+% 17. SUPPLEMENTARY FIGURE S8 — GPR CALIBRATION
+% ========================================================================
+
+nominal_levels = [0.50 0.80 0.90 0.95];
+
+figure('Color','w',...
+       'Position',[100 100 figure_width figure_height]);
+
+tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+GPR_Calibration = struct();
+
+for out = 1:n_outputs
+
+    nexttile;
+
+    mdl = GPR_models{out};
+
+    [mu_norm,sd_norm] = predict(mdl,X_test);
+
+    actual = Y_test(:,out);
+
+    empirical = zeros(size(nominal_levels));
+
+    for k = 1:numel(nominal_levels)
+
+        z = norminv((1+nominal_levels(k))/2);
+
+        lo = mu_norm-z*sd_norm;
+        hi = mu_norm+z*sd_norm;
+
+        empirical(k) = mean(actual >= lo & actual <= hi);
+
+    end
+
+    GPR_Calibration(out).nominal = nominal_levels;
+    GPR_Calibration(out).empirical = empirical;
+
+    plot(100*nominal_levels,...
+         100*empirical,...
+         'o-','LineWidth',1.8);
+
+    hold on;
+
+    plot([0 100],[0 100],'k--','LineWidth',1.2);
+
+    xlabel('Nominal coverage (%)');
+    ylabel('Empirical coverage (%)');
+
+    title(output_names{out},'Interpreter','none');
+
+    xlim([0 100]);
+    ylim([0 100]);
+
+    grid on;
+    box on;
+
+end
+
+sgtitle('GPR predictive interval calibration',...
+        'FontWeight','bold');
+
+save_myfig(gcf,'S8_GPR_Calibration');
+
+
+%% ========================================================================
+% 18. INPUT CORRELATION
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' INPUT CORRELATION\n');
+fprintf('============================================================\n');
+
+SpearmanCorrelation = corr(X_train_raw,...
+                           'Type','Spearman',...
+                           'Rows','complete');
+
+disp(SpearmanCorrelation);
+
+fprintf(['\nNOTE: Classical Sobol analysis below assumes independent ',...
+         'input distributions. Strong empirical correlations mean ',...
+         'these Sobol indices should be interpreted as sensitivity ',...
+         'over an independent design domain rather than as ',...
+         'correlation-aware sensitivity indices.\n']);
+
+
+%% ========================================================================
+% 19. SOBOL GLOBAL SENSITIVITY
+% ========================================================================
+%
+% Variance-based global sensitivity analysis using independent
+% U(0,1) distributions in the normalized input domain.
+%
+% A and B are independent Monte-Carlo sample matrices.
+%
+% For each input i:
+%
+%   ABi = A with column i replaced by column i from B
+%
+% First-order index:
+%
+%   S_i = E[Y_B (Y_ABi - Y_A)] / Var(Y)
+%
+% Total-order index:
+%
+%   ST_i = E[(Y_A - Y_ABi)^2] / (2 Var(Y))
+%
+% The analysis is performed on the GPR surrogate.
+%
+% IMPORTANT:
+% These are independent-input Sobol indices. They are NOT
+% correlation-aware Sobol indices.
+%
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' SOBOL GLOBAL SENSITIVITY ANALYSIS\n');
+fprintf('============================================================\n');
+
+% ------------------------------------------------------------
+% Reproducible independent sampling
+% ------------------------------------------------------------
+
+rng(4444,'twister');
+
+A = rand(Sobol_N,n_inputs);
+B = rand(Sobol_N,n_inputs);
+
+Sobol_S1 = NaN(n_outputs,n_inputs);
+Sobol_ST = NaN(n_outputs,n_inputs);
+
+Sobol_Variance = NaN(n_outputs,1);
+Sobol_SumS1 = NaN(n_outputs,1);
+Sobol_MaxST = NaN(n_outputs,1);
+
+for out = 1:n_outputs
+
+    fprintf('\n------------------------------------------------------------\n');
+    fprintf('Output: %s\n',output_names{out});
+    fprintf('------------------------------------------------------------\n');
+
+    model = GPR_models{out};
+
+    % --------------------------------------------------------
+    % Evaluate base samples
+    % --------------------------------------------------------
+
+    fA = predict(model,A);
+    fB = predict(model,B);
+
+    fA = fA(:);
+    fB = fB(:);
+
+    % Combined variance estimate
+    Y_combined = [fA;fB];
+
+    VY = var(Y_combined,1);
+
+    Sobol_Variance(out) = VY;
+
+    if VY <= eps
+
+        warning('Sobol variance is numerically zero for output %d.',out);
+        continue;
+
+    end
+
+    % --------------------------------------------------------
+    % Evaluate Sobol estimators
+    % --------------------------------------------------------
+
+    for i = 1:n_inputs
+
+        ABi = A;
+        ABi(:,i) = B(:,i);
+
+        fABi = predict(model,ABi);
+        fABi = fABi(:);
+
+        % ----------------------------------------------------
+        % First-order Saltelli estimator
+        % ----------------------------------------------------
+
+        S1 = mean( ...
+            fB .* (fABi - fA) ...
+            ) / VY;
+
+        % ----------------------------------------------------
+        % Total-order Jansen estimator
+        % ----------------------------------------------------
+
+        ST = mean( ...
+            (fA - fABi).^2 ...
+            ) / (2*VY);
+
+        Sobol_S1(out,i) = S1;
+        Sobol_ST(out,i) = ST;
+
+    end
+
+    % --------------------------------------------------------
+    % Numerical diagnostics
+    % --------------------------------------------------------
+
+    Sobol_SumS1(out) = sum(Sobol_S1(out,:));
+    Sobol_MaxST(out) = max(Sobol_ST(out,:));
+
+    fprintf('\nVariance of surrogate response = %.10g\n',VY);
+
+    fprintf('\nFirst-order Sobol indices (S_i):\n');
+
+    for i = 1:n_inputs
+        fprintf('  %-10s = %.6f\n', ...
+            input_names{i},Sobol_S1(out,i));
+    end
+
+    fprintf('\nTotal-order Sobol indices (ST_i):\n');
+
+    for i = 1:n_inputs
+        fprintf('  %-10s = %.6f\n', ...
+            input_names{i},Sobol_ST(out,i));
+    end
+
+    fprintf('\nSum of first-order indices = %.6f\n', ...
+        Sobol_SumS1(out));
+
+    fprintf('Maximum total-order index   = %.6f\n', ...
+        Sobol_MaxST(out));
+
+    % --------------------------------------------------------
+    % Interpretation diagnostics
+    % --------------------------------------------------------
+
+    if any(Sobol_ST(out,:) > 1.05)
+
+        fprintf(['WARNING: At least one total-order index exceeds ', ...
+                 '1.05. Increase Sobol_N and verify surrogate ', ...
+                 'behavior over the full U(0,1) domain before ', ...
+                 'using these values in the manuscript.\n']);
+
+    end
+
+    if any(Sobol_S1(out,:) < -0.05)
+
+        fprintf(['WARNING: A first-order index is substantially ', ...
+                 'negative. This indicates Monte-Carlo estimator ', ...
+                 'uncertainty or an unstable surrogate region.\n']);
+
+    end
+
+    if Sobol_SumS1(out) > 1.05
+
+        fprintf(['WARNING: Sum of first-order indices exceeds 1.05. ', ...
+                 'This may indicate sampling error or strong ', ...
+                 'surrogate interactions.\n']);
+
+    end
+
+end
+
+% ------------------------------------------------------------
+% Optional conservative numerical cleanup
+% ------------------------------------------------------------
+%
+% DO NOT use clipping to hide invalid results.
+% Only values within tiny numerical tolerance of zero are
+% corrected.
+
+tol = 1e-10;
+
+Sobol_S1(abs(Sobol_S1) < tol) = 0;
+Sobol_ST(abs(Sobol_ST) < tol) = 0;
+
+fprintf('\nSobol analysis completed.\n');
+
+%% ========================================================================
+% 20. FIGURE 3 — SOBOL PLOT
+% ========================================================================
+
+figure('Color','w',...
+       'Position',[100 100 figure_width figure_height]);
+
+tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+for out = 1:n_outputs
+
+    nexttile;
+
+    values = [Sobol_S1(out,:);Sobol_ST(out,:)]';
+
+    bar(values);
+
+    yline(0,'k-');
+
+    set(gca,...
+        'XTick',1:n_inputs,...
+        'XTickLabel',input_names);
+
+    ylabel('Sobol index');
+
+    legend({'S_i','S_{Ti}'},...
+        'Location','best');
+
+    title(output_names{out},'Interpreter','none');
+
+    grid on;
+    box on;
+
+end
+
+sgtitle(['Variance-based Sobol sensitivity — independent U(0,1) ',...
+         'input domain'],...
+        'FontWeight','bold');
+
+save_myfig(gcf,'Figure_3_Sobol_Sensitivity');
+
+
+%% ========================================================================
+% 21. EXACT SHAP ANALYSIS
+% ========================================================================
+%
+% Because there are only 3 inputs:
+%
+%       2^3 = 8 subsets
+%
+% can be evaluated exactly.
+%
+% The SHAP implementation below uses an interventional/background
+% distribution represented by randomly selected training observations.
+%
+% The explained observations come ONLY from the independent test set.
+%
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' EXACT SHAP ANALYSIS\n');
+fprintf('============================================================\n');
+
+rng(2222);
+
+background_n = min(SHAP_background_size,size(X_train,1));
+background_idx = randperm(size(X_train,1),background_n);
+
+X_background = X_train(background_idx,:);
+
+explained_n = min(SHAP_test_size,size(X_test,1));
+explained_idx = randperm(size(X_test,1),explained_n);
+
+X_explained = X_test(explained_idx,:);
+
+n_explained = size(X_explained,1);
+
+SHAP_values = cell(n_outputs,1);
+SHAP_base = zeros(n_outputs,1);
+SHAP_additivity_error = zeros(n_outputs,1);
+
+% All subsets for 3 features
+n_subsets = 2^n_inputs;
+
+for out = 1:n_outputs
+
+    fprintf('\nSHAP output: %s\n',output_names{out});
+
+    model = GPR_models{out};
+
+    % Baseline
+    baseline_predictions = predict(model,X_background);
+
+    SHAP_base(out) = mean(baseline_predictions);
+
+    phi = zeros(n_explained,n_inputs);
+
+    for obs = 1:n_explained
+
+        x = X_explained(obs,:);
+
+        % Value function for all subsets
+        v = zeros(n_subsets,1);
+
+        for subset = 0:(n_subsets-1)
+
+            included = false(1,n_inputs);
+
+            for j = 1:n_inputs
+                included(j) = bitget(subset,j) == 1;
+            end
+
+            X_temp = repmat(X_background,1,1);
+
+            for j = 1:n_inputs
+
+                if included(j)
+                    X_temp(:,j) = x(j);
+                end
+
+            end
+
+            pred_temp = predict(model,X_temp);
+
+            v(subset+1) = mean(pred_temp);
+
+        end
+
+        % ---------------------------------------------------------------
+        % Exact Shapley value
+        % ---------------------------------------------------------------
+
+        for i = 1:n_inputs
+
+            other_features = setdiff(1:n_inputs,i);
+
+            phi_i = 0;
+
+            % Enumerate subsets excluding i
+            for subset_other = 0:(2^(n_inputs-1)-1)
+
+                S = false(1,n_inputs);
+
+                for k = 1:numel(other_features)
+                    S(other_features(k)) = ...
+                        bitget(subset_other,k) == 1;
+                end
+
+                S_without_i = S;
+
+                S_with_i = S;
+                S_with_i(i) = true;
+
+                size_S = sum(S);
+
+                weight = factorial(size_S) * ...
+                    factorial(n_inputs-size_S-1) / ...
+                    factorial(n_inputs);
+
+                idx_without = subset_to_index(S_without_i);
+                idx_with = subset_to_index(S_with_i);
+
+                phi_i = phi_i + ...
+                    weight*(v(idx_with)-v(idx_without));
+
+            end
+
+            phi(obs,i) = phi_i;
+
+        end
+
+    end
+
+    SHAP_values{out} = phi;
+
+    % ---------------------------------------------------------------
+    % Additivity diagnostic
+    % ---------------------------------------------------------------
+
+    model_prediction = predict(model,X_explained);
+
+    reconstructed = SHAP_base(out) + sum(phi,2);
+
+    additivity_error = max(abs(model_prediction-reconstructed));
+
+    SHAP_additivity_error(out) = additivity_error;
+
+    fprintf('Maximum SHAP additivity error = %.12g\n',...
+        additivity_error);
+
+end
+
+
+%% ========================================================================
+% 22. FIGURE 4 — SIGNED SHAP SUMMARY
+% ========================================================================
+
+figure('Color','w',...
+       'Position',[100 100 figure_width figure_height]);
+
+tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+for out = 1:n_outputs
+
+    nexttile;
+
+    phi = SHAP_values{out};
+
+    % Sort features by mean absolute SHAP
+    mean_abs = mean(abs(phi),1);
+
+    [~,order] = sort(mean_abs,'descend');
+
+    hold on;
+
+    for k = 1:n_inputs
+
+        feature = order(k);
+
+        y = k*ones(size(phi,1),1);
+
+        % jitter
+        y = y + 0.10*(rand(size(y))-0.5);
+
+        scatter(phi(:,feature),y,18,'filled');
+
+    end
+
+    xline(0,'k-');
+
+    set(gca,...
+        'YTick',1:n_inputs,...
+        'YTickLabel',input_names(order));
+
+    xlabel('SHAP value (normalized output units)');
+    ylabel('Feature');
+
+    title(output_names{out},'Interpreter','none');
+
+    grid on;
+    box on;
+
+end
+
+sgtitle('Exact signed SHAP summary on independent test observations',...
+        'FontWeight','bold');
+
+save_myfig(gcf,'Figure_4_SHAP_Summary');
+
+
+%% ========================================================================
+% 23. SUPPLEMENTARY FIGURE S6 — SHAP DEPENDENCE
+% ========================================================================
+
+for out = 1:n_outputs
+
+    figure('Color','w',...
+        'Position',[100 100 figure_width figure_height]);
+
+    tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+    phi = SHAP_values{out};
+
+    for feature = 1:n_inputs
+
+        nexttile;
+
+        scatter(...
+            X_explained(:,feature),...
+            phi(:,feature),...
+            25,...
+            'filled');
+
+        hold on;
+
+        yline(0,'k-');
+
+        xlabel(sprintf('%s (normalized)',input_names{feature}),...
+            'Interpreter','none');
+
+        ylabel('SHAP value (normalized output units)');
+
+        title(input_names{feature},'Interpreter','none');
+
+        grid on;
+        box on;
+
+    end
+
+    sgtitle(sprintf('%s — SHAP dependence analysis',...
+        output_names{out}),...
+        'FontWeight','bold');
+
+    save_myfig(gcf,...
+        sprintf('S6_SHAP_Dependence_%s',...
+        sanitize_filename(output_names{out})));
+
+end
+
+
+%% ========================================================================
+% 24. EXACT PAIRWISE SHAP INTERACTION
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' SHAP INTERACTION ANALYSIS\n');
+fprintf('============================================================\n');
+
+SHAP_interactions = cell(n_outputs,1);
+
+for out = 1:n_outputs
+
+    fprintf('\nOutput: %s\n',output_names{out});
+
+    model = GPR_models{out};
+
+    phi_interaction = zeros(n_explained,n_inputs,n_inputs);
+
+    for obs = 1:n_explained
+
+        x = X_explained(obs,:);
+
+        % ---------------------------------------------------------------
+        % Recalculate subset value function
+        % ---------------------------------------------------------------
+
+        v = zeros(n_subsets,1);
+
+        for subset = 0:(n_subsets-1)
+
+            included = false(1,n_inputs);
+
+            for j = 1:n_inputs
+                included(j) = bitget(subset,j) == 1;
+            end
+
+            X_temp = X_background;
+
+            for j = 1:n_inputs
+
+                if included(j)
+                    X_temp(:,j) = x(j);
+                end
+
+            end
+
+            pred_temp = predict(model,X_temp);
+
+            v(subset+1) = mean(pred_temp);
+
+        end
+
+        % ---------------------------------------------------------------
+        % Pairwise interactions
+        % ---------------------------------------------------------------
+
+        for i = 1:n_inputs
+
+            for j = i+1:n_inputs
+
+                remaining = setdiff(1:n_inputs,[i j]);
+
+                interaction_ij = 0;
+
+                n_remaining_subsets = 2^numel(remaining);
+
+                for subset_other = 0:(n_remaining_subsets-1)
+
+                    S = false(1,n_inputs);
+
+                    for k = 1:numel(remaining)
+
+                        S(remaining(k)) = ...
+                            bitget(subset_other,k) == 1;
+
+                    end
+
+                    Sij = S;
+                    Sij(i) = true;
+                    Sij(j) = true;
+
+                    Si = S;
+                    Si(i) = true;
+
+                    Sj = S;
+                    Sj(j) = true;
+
+                    idx_S = subset_to_index(S);
+                    idx_Si = subset_to_index(Si);
+                    idx_Sj = subset_to_index(Sj);
+                    idx_Sij = subset_to_index(Sij);
+
+                    size_S = sum(S);
+
+                    weight = factorial(size_S)*...
+                        factorial(n_inputs-size_S-2)/...
+                        (2*factorial(n_inputs-1));
+
+                    interaction_ij = interaction_ij + ...
+                        weight*( ...
+                        v(idx_Sij)-...
+                        v(idx_Si)-...
+                        v(idx_Sj)+...
+                        v(idx_S));
+
+                end
+
+                phi_interaction(obs,i,j) = interaction_ij;
+                phi_interaction(obs,j,i) = interaction_ij;
+
+            end
+
+        end
+
+    end
+
+    SHAP_interactions{out} = phi_interaction;
+
+end
+
+
+%% ========================================================================
+% 25. FIGURE 6 — SHAP INTERACTION HEATMAPS
+% ========================================================================
+
+figure('Color','w',...
+       'Position',[100 100 figure_width figure_height]);
+
+tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+for out = 1:n_outputs
+
+    nexttile;
+
+    interaction = SHAP_interactions{out};
+
+    % Mean absolute pairwise interaction
+    M = squeeze(mean(abs(interaction),1));
+
+    imagesc(M);
+
+    axis square;
+
+    colorbar;
+
+    set(gca,...
+        'XTick',1:n_inputs,...
+        'XTickLabel',input_names,...
+        'YTick',1:n_inputs,...
+        'YTickLabel',input_names);
+
+    xtickangle(30);
+
+    xlabel('Feature');
+    ylabel('Feature');
+
+    title(output_names{out},'Interpreter','none');
+
+end
+
+sgtitle('Mean absolute pairwise SHAP interaction',...
+        'FontWeight','bold');
+
+save_myfig(gcf,'Figure_6_SHAP_Interactions');
+
+
+%% ========================================================================
+% 26. SUPPLEMENTARY FIGURE S7 — DETAILED SHAP INTERACTION
+% ========================================================================
+
+for out = 1:n_outputs
+
+    figure('Color','w',...
+        'Position',[100 100 figure_width figure_height]);
+
+    interaction = SHAP_interactions{out};
+
+    M = squeeze(mean(abs(interaction),1));
+
+    imagesc(M);
+
+    axis square;
+
+    colorbar;
+
+    set(gca,...
+        'XTick',1:n_inputs,...
+        'XTickLabel',input_names,...
+        'YTick',1:n_inputs,...
+        'YTickLabel',input_names);
+
+    xtickangle(30);
+
+    xlabel('Feature');
+    ylabel('Feature');
+
+    title(sprintf('%s — mean absolute pairwise SHAP interaction',...
+        output_names{out}),...
+        'Interpreter','none');
+
+    save_myfig(gcf,...
+        sprintf('S7_SHAP_Interaction_%s',...
+        sanitize_filename(output_names{out})));
+
+end
+
+%% ============================================================
+% BOTTOM-PHASE GPR DIAGNOSTIC
+% ============================================================
+
+out = 4;   % bottom phase
+
+fprintf('\n\n============================================\n');
+fprintf('BOTTOM-PHASE DIAGNOSTIC\n');
+fprintf('============================================\n');
+
+fprintf('Y_min(4)   = %.15g\n',Y_min(out));
+fprintf('Y_max(4)   = %.15g\n',Y_max(out));
+fprintf('Y_range(4) = %.15g\n',Y_range(out));
+
+fprintf('\nRAW bottom-phase training range:\n');
+fprintf('Min = %.15g\n',min(Y_train_raw(:,out)));
+fprintf('Max = %.15g\n',max(Y_train_raw(:,out)));
+
+fprintf('\nNORMALIZED bottom-phase training range:\n');
+fprintf('Min = %.15g\n',min(Y_train(:,out)));
+fprintf('Max = %.15g\n',max(Y_train(:,out)));
+
+%% Direct GPR prediction on TEST data
+
+[ytest_norm,ystd] = predict(GPR_models{out},X_test);
+
+fprintf('\nGPR TEST normalized prediction:\n');
+fprintf('Min = %.15g\n',min(ytest_norm));
+fprintf('Max = %.15g\n',max(ytest_norm));
+
+ytest_phys = ytest_norm .* Y_range(out) + Y_min(out);
+
+fprintf('\nGPR TEST physical prediction:\n');
+fprintf('Min = %.15g\n',min(ytest_phys));
+fprintf('Max = %.15g\n',max(ytest_phys));
+
+fprintf('\nActual TEST bottom-phase range:\n');
+fprintf('Min = %.15g\n',min(Y_test_raw(:,out)));
+fprintf('Max = %.15g\n',max(Y_test_raw(:,out)));
+%% ============================================================
+% SUPPORT-AWARE PDP AND ICE ANALYSIS
+% ============================================================
+
+fprintf('\n============================================================\n');
+fprintf(' SUPPORT-AWARE PDP AND ICE ANALYSIS\n');
+fprintf('============================================================\n');
+
+N_pdp = 40;
+N_ice = 40;
+
+% ------------------------------------------------------------
+% Empirical support assessment
+% ------------------------------------------------------------
+%
+% Because the three inputs are strongly correlated, support is
+% assessed using the nearest training observation rather than
+% independent marginal ranges.
+%
+% The threshold is derived from leave-one-out nearest-neighbour
+% distances among training observations.
+%
+% This is an empirical support screen, not a formal probability
+% density boundary.
+% ------------------------------------------------------------
+
+rng(5555,'twister');
+
+[~,dist_train_nn] = knnsearch( ...
+    X_train,...
+    X_train,...
+    'K',2);
+
+% First neighbour is the observation itself.
+% Second neighbour is the nearest independent training point.
+train_nn_distance = dist_train_nn(:,2);
+
+% 95th percentile of leave-one-out nearest-neighbour distance
+support_threshold = prctile(train_nn_distance,95);
+
+fprintf('\nEmpirical nearest-neighbour support threshold = %.6f\n',...
+    support_threshold);
+
+fprintf('Training nearest-neighbour distance:\n');
+fprintf('  Median = %.6f\n',median(train_nn_distance));
+fprintf('  95th percentile = %.6f\n',support_threshold);
+fprintf('  Maximum = %.6f\n',max(train_nn_distance));
+
+%% ------------------------------------------------------------
+% Storage
+% ------------------------------------------------------------
+
+PDP_results = cell(n_outputs,n_inputs);
+ICE_results = cell(n_outputs,n_inputs);
+
+%% ============================================================
+% PDP
+% ============================================================
+
+for out = 1:n_outputs
+
+    fprintf('\nPDP output: %s\n',output_names{out});
+
+    for feature = 1:n_inputs
+
+        fprintf('  Input %d\n',feature);
+
+        % Use 5th-95th percentile instead of full min-max range
+        x5  = prctile(X_train(:,feature),5);
+        x95 = prctile(X_train(:,feature),95);
+
+        x_grid = linspace(x5,x95,N_pdp)';
+
+        pdp_norm = NaN(N_pdp,1);
+        pdp_n_supported = zeros(N_pdp,1);
+        pdp_support_fraction = zeros(N_pdp,1);
+
+        for g = 1:N_pdp
+
+            % ------------------------------------------------
+            % Standard PDP construction
+            % ------------------------------------------------
+            X_pdp = X_train;
+
+            X_pdp(:,feature) = x_grid(g);
+
+            % ------------------------------------------------
+            % ------------------------------------------------
+% Evaluate empirical support
+% ------------------------------------------------
+
+[~,d] = knnsearch( ...
+    X_train,...
+    X_pdp,...
+    'K',1);
+
+supported = d <= support_threshold;
+
+pdp_n_supported(g) = sum(supported);
+pdp_support_fraction(g) = mean(supported);
+
+% ------------------------------------------------
+% Predict only supported combinations
+% ------------------------------------------------
+
+if any(supported)
+
+    ypred = predict( ...
+        GPR_models{out},...
+        X_pdp(supported,:));
+
+    pdp_norm(g) = mean(ypred);
+
+else
+
+    pdp_norm(g) = NaN;
+
+end
+        % Convert back to physical units
+        pdp_phys = pdp_norm .* Y_range(out) + Y_min(out);
+
+        % Save
+        PDP_results{out,feature}.x_norm = x_grid;
+        PDP_results{out,feature}.y_norm = pdp_norm;
+        PDP_results{out,feature}.y_phys = pdp_phys;
+        PDP_results{out,feature}.support_fraction = ...
+            pdp_support_fraction;
+        PDP_results{out,feature}.n_supported = ...
+            pdp_n_supported;
+
+    end
+end
+end
+
+%% ============================================================
+% ICE
+% ============================================================
+
+fprintf('\n============================================================\n');
+fprintf(' INDIVIDUAL CONDITIONAL EXPECTATION (ICE)\n');
+fprintf('============================================================\n');
+
+% Number of test observations used for ICE
+N_ice_obs = min(25,size(X_test,1));
+
+% Reproducible selection
+rng(1234);
+
+ice_obs = randperm(size(X_test,1),N_ice_obs);
+
+for out = 1:n_outputs
+
+    fprintf('\nICE output: %s\n',output_names{out});
+
+    for feature = 1:n_inputs
+
+        fprintf('  Input %d\n',feature);
+
+        x5  = prctile(X_train(:,feature),5);
+        x95 = prctile(X_train(:,feature),95);
+
+        x_grid = linspace(x5,x95,N_ice)';
+
+        ICE_norm = NaN(N_ice,N_ice_obs);
+        ICE_phys = NaN(N_ice,N_ice_obs);
+
+        for obs = 1:N_ice_obs
+
+            x0 = X_test(ice_obs(obs),:);
+
+            for g = 1:N_ice
+
+                X_ice = x0;
+
+                X_ice(feature) = x_grid(g);
+
+             % --------------------------------------------
+% Check empirical support
+% --------------------------------------------
+
+[~,d] = knnsearch( ...
+    X_train,...
+    X_ice,...
+    'K',1);
+
+if d <= support_threshold
+
+    ypred = predict(GPR_models{out},X_ice);
+
+    ICE_norm(g,obs) = ypred;
+
+    ICE_phys(g,obs) = ...
+        ypred .* Y_range(out) + Y_min(out);
+
+else
+
+    % Unsupported extrapolation
+    ICE_norm(g,obs) = NaN;
+    ICE_phys(g,obs) = NaN;
+
+end
+
+            end
+
+        end
+
+        % ----------------------------------------------------
+        % Diagnostic
+        % ----------------------------------------------------
+
+        valid_values = ICE_phys(~isnan(ICE_phys));
+
+        if isempty(valid_values)
+
+            fprintf('    No supported ICE predictions.\n');
+
+        else
+
+            fprintf('    Supported ICE range: %.4f to %.4f\n',...
+                min(valid_values),max(valid_values));
+
+        end
+% ------------------------------------------------------------
+% Compare supported ICE predictions with training output range
+% ------------------------------------------------------------
+
+if ~isempty(valid_values)
+
+    physical_min = Y_min(out);
+    physical_max = Y_max(out);
+
+    outside_range = ...
+        valid_values < physical_min | ...
+        valid_values > physical_max;
+
+    fraction_outside = mean(outside_range);
+
+    fprintf('    Supported ICE range: %.4f to %.4f\n',...
+        min(valid_values),max(valid_values));
+
+    fprintf('    Training output range: %.4f to %.4f\n',...
+        physical_min,physical_max);
+
+    fprintf('    Fraction outside training output range: %.2f %%\n',...
+        100*fraction_outside);
+
+else
+
+    fprintf('    No supported ICE predictions.\n');
+
+end
+        % ----------------------------------------------------
+        % Save
+        % ----------------------------------------------------
+
+        ICE_results{out,feature}.x_norm = x_grid;
+        ICE_results{out,feature}.y_norm = ICE_norm;
+        ICE_results{out,feature}.y_phys = ICE_phys;
+
+    end
+end
+
+
+%% ============================================================
+% FIGURE 5 - SUPPORT-AWARE PDP + ICE
+% ============================================================
+
+figure('Color','w','Position',[100 100 1400 900]);
+
+for out = 1:n_outputs
+
+    subplot(2,2,out);
+    hold on;
+
+    for feature = 1:n_inputs
+
+        % ----------------------------------------------------
+        % PDP
+        % ----------------------------------------------------
+
+        x = PDP_results{out,feature}.x_norm;
+        y = PDP_results{out,feature}.y_phys;
+
+        plot(x,y,'LineWidth',2);
+
+    end
+
+    xlabel('Normalized input value');
+    ylabel(output_names{out},'Interpreter','none');
+
+    title(['Support-aware PDP: ',output_names{out}],...
+        'Interpreter','none');
+
+    grid on;
+    box on;
+
+end
+
+sgtitle('Support-aware partial dependence analysis');
+
+save_myfig(gcf,'Figure_5_Support_Aware_PDP');
+%% ============================================================
+% FIGURE 5B - SUPPORT-AWARE ICE
+% ============================================================
+
+figure('Color','w','Position',[100 100 1400 900]);
+
+for out = 1:n_outputs
+
+    subplot(2,2,out);
+    hold on;
+
+    for feature = 1:n_inputs
+
+        x = ICE_results{out,feature}.x_norm;
+        Y = ICE_results{out,feature}.y_phys;
+
+        % Plot individual supported ICE curves
+        for obs = 1:size(Y,2)
+
+            plot(x,Y(:,obs),'LineWidth',0.6);
+
+        end
+
+        % Mean ICE
+        mean_ice = mean(Y,2,'omitnan');
+
+        plot(x,mean_ice,'k','LineWidth',2.5);
+
+    end
+
+    xlabel('Normalized input value');
+    ylabel(output_names{out},'Interpreter','none');
+
+    title(['Support-aware ICE: ',output_names{out}],...
+        'Interpreter','none');
+
+    grid on;
+    box on;
+
+end
+
+sgtitle('Support-aware individual conditional expectation');
+
+save_myfig(gcf,'Figure_5B_Support_Aware_ICE');
+
+%% ========================================================================
+% 32. RF PERMUTATION IMPORTANCE
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' RANDOM FOREST PERMUTATION IMPORTANCE\n');
+fprintf('============================================================\n');
+
+PermutationImportance = zeros(n_outputs,n_inputs);
+
+for out = 1:n_outputs
+
+    model = RF_models{out};
+
+    baseline_pred = predict(model,X_test);
+
+    baseline_mse = mean((Y_test(:,out)-baseline_pred).^2);
+
+    for feature = 1:n_inputs
+
+        X_perm = X_test;
+
+        rng(3000+out*100+feature);
+
+        perm_idx = randperm(size(X_test,1));
+
+        X_perm(:,feature) = X_perm(perm_idx,feature);
+
+        perm_pred = predict(model,X_perm);
+
+        perm_mse = mean((Y_test(:,out)-perm_pred).^2);
+
+        PermutationImportance(out,feature) = ...
+            perm_mse-baseline_mse;
+
+    end
+
+end
+
+
+%% ========================================================================
+% 33. SUPPLEMENTARY FIGURE S9 — RF PERMUTATION IMPORTANCE
+% ========================================================================
+
+figure('Color','w',...
+       'Position',[100 100 figure_width figure_height]);
+
+tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+for out = 1:n_outputs
+
+    nexttile;
+
+    bar(PermutationImportance(out,:));
+
+    set(gca,...
+        'XTick',1:n_inputs,...
+        'XTickLabel',input_names);
+
+    ylabel('Increase in test MSE');
+
+    title(output_names{out},'Interpreter','none');
+
+    grid on;
+    box on;
+
+end
+
+sgtitle('Random Forest permutation importance',...
+        'FontWeight','bold');
+
+save_myfig(gcf,'S9_RF_Permutation_Importance');
+
+
+%% ========================================================================
+% 34. OPTIONAL: UNCERTAINTY AT NSGA-II OPTIMIZED SOLUTIONS
+% ========================================================================
+%
+% IMPORTANT:
+%
+% DO NOT invent optimization solutions.
+%
+% If your NSGA-II results are available, put the normalized decision
+% variable matrix here:
+%
+%       X_opt_normalized = [...]
+%
+% Dimensions:
+%
+%       N_optimal_solutions × n_inputs
+%
+% Example:
+%
+%       X_opt_normalized = readmatrix('NSGAII_Pareto_Solutions.xlsx');
+%
+% The matrix must contain the SAME INPUTS and normalization used above.
+%
+% ========================================================================
+
+X_opt_normalized = [];
+
+if ~isempty(X_opt_normalized)
+
+    fprintf('\n============================================================\n');
+    fprintf(' GPR UNCERTAINTY AT OPTIMIZED SOLUTIONS\n');
+    fprintf('============================================================\n');
+
+    if size(X_opt_normalized,2) ~= n_inputs
+
+        error(['X_opt_normalized must contain %d columns.'],...
+              n_inputs);
+
+    end
+
+    n_opt = size(X_opt_normalized,1);
+
+    OptimizationUncertainty = struct();
+
+    for out = 1:n_outputs
+
+        [mu_norm,sd_norm] = predict(...
+            GPR_models{out},...
+            X_opt_normalized);
+
+        mu_phys = ...
+            mu_norm.*Y_range(out)+Y_min(out);
+
+        sd_phys = ...
+            sd_norm.*Y_range(out);
+
+        lower_phys = ...
+            (mu_norm-z_value*sd_norm).*Y_range(out)+Y_min(out);
+
+        upper_phys = ...
+            (mu_norm+z_value*sd_norm).*Y_range(out)+Y_min(out);
+
+        OptimizationUncertainty(out).output = output_names{out};
+        OptimizationUncertainty(out).mean = mu_phys;
+        OptimizationUncertainty(out).sd = sd_phys;
+        OptimizationUncertainty(out).lower = lower_phys;
+        OptimizationUncertainty(out).upper = upper_phys;
+
+        fprintf('\n%s\n',output_names{out});
+        fprintf('Mean predicted uncertainty = %.6f\n',...
+            mean(sd_phys));
+        fprintf('Maximum uncertainty = %.6f\n',...
+            max(sd_phys));
+
+    end
+
+    % ---------------------------------------------------------------
+    % Figure 8
+    % ---------------------------------------------------------------
+
+    figure('Color','w',...
+        'Position',[100 100 figure_width figure_height]);
+
+    tiledlayout(2,2,'TileSpacing','compact','Padding','compact');
+
+    for out = 1:n_outputs
+
+        nexttile;
+
+        errorbar(...
+            1:n_opt,...
+            OptimizationUncertainty(out).mean,...
+            OptimizationUncertainty(out).sd,...
+            'o');
+
+        xlabel('Optimized solution');
+        ylabel(sprintf('%s (physical units)',...
+            output_names{out}),...
+            'Interpreter','none');
+
+        title(output_names{out},'Interpreter','none');
+
+        grid on;
+        box on;
+
+    end
+
+    sgtitle('GPR uncertainty associated with NSGA-II optimized solutions',...
+        'FontWeight','bold');
+
+    save_myfig(gcf,'Figure_8_Optimization_Uncertainty');
+
+else
+
+    fprintf('\nNo NSGA-II solution matrix supplied.\n');
+    fprintf('Figure 8 was therefore not generated.\n');
+    fprintf(['This avoids making unsupported claims about uncertainty ',...
+             'at optimized operating points.\n']);
+
+end
+
+
+%% ========================================================================
+% 35. CREATE METRIC TABLES
+% ========================================================================
+
+fprintf('\n============================================================\n');
+fprintf(' CREATING RESULT TABLES\n');
+fprintf('============================================================\n');
+
+% -------------------------------------------------------------------------
+% BASE MODEL TABLE
+% -------------------------------------------------------------------------
+
+BaseMetricTable = table();
+
+for out = 1:n_outputs
+
+    row = table(...
+        string(output_names{out}),...
+        BaseMetrics.RF.R2(out),...
+        BaseMetrics.RF.RMSE_norm(out),...
+        BaseMetrics.RF.MAE_norm(out),...
+        BaseMetrics.RF.RMSE_phys(out),...
+        BaseMetrics.RF.MAE_phys(out),...
+        BaseMetrics.SVR.R2(out),...
+        BaseMetrics.SVR.RMSE_norm(out),...
+        BaseMetrics.SVR.MAE_norm(out),...
+        BaseMetrics.SVR.RMSE_phys(out),...
+        BaseMetrics.SVR.MAE_phys(out),...
+        BaseMetrics.GPR.R2(out),...
+        BaseMetrics.GPR.RMSE_norm(out),...
+        BaseMetrics.GPR.MAE_norm(out),...
+        BaseMetrics.GPR.RMSE_phys(out),...
+        BaseMetrics.GPR.MAE_phys(out),...
+        'VariableNames',{...
+        'Output',...
+        'RF_R2','RF_RMSE_norm','RF_MAE_norm','RF_RMSE_phys','RF_MAE_phys',...
+        'SVR_R2','SVR_RMSE_norm','SVR_MAE_norm','SVR_RMSE_phys','SVR_MAE_phys',...
+        'GPR_R2','GPR_RMSE_norm','GPR_MAE_norm','GPR_RMSE_phys','GPR_MAE_phys'});
+
+    BaseMetricTable = [BaseMetricTable;row];
+
+end
+
+
+%% ========================================================================
+% 36. ENSEMBLE TABLE
+% ========================================================================
+
+EnsembleMetricTable = table();
+
+for out = 1:n_outputs
+
+    true_norm = Y_test(:,out);
+
+    % Voting
+    pred = Voting_pred_test(:,out);
+
+    voting_R2 = 1-sum((true_norm-pred).^2)/...
+        sum((true_norm-mean(true_norm)).^2);
+
+    voting_RMSE_norm = sqrt(mean((true_norm-pred).^2));
+    voting_MAE_norm = mean(abs(true_norm-pred));
+
+    pred_phys = pred.*Y_range(out)+Y_min(out);
+
+    voting_RMSE_phys = sqrt(mean(...
+        (Y_test_raw(:,out)-pred_phys).^2));
+
+    voting_MAE_phys = mean(abs(...
+        Y_test_raw(:,out)-pred_phys));
+
+    % Stacking
+    stacking_R2 = StackingMetrics.R2(out);
+    stacking_RMSE_norm = StackingMetrics.RMSE_norm(out);
+    stacking_MAE_norm = StackingMetrics.MAE_norm(out);
+    stacking_RMSE_phys = StackingMetrics.RMSE_phys(out);
+    stacking_MAE_phys = StackingMetrics.MAE_phys(out);
+
+    row = table(...
+        string(output_names{out}),...
+        voting_R2,...
+        voting_RMSE_norm,...
+        voting_MAE_norm,...
+        voting_RMSE_phys,...
+        voting_MAE_phys,...
+        stacking_R2,...
+        stacking_RMSE_norm,...
+        stacking_MAE_norm,...
+        stacking_RMSE_phys,...
+        stacking_MAE_phys,...
+        'VariableNames',{...
+        'Output',...
+        'Voting_R2',...
+        'Voting_RMSE_norm',...
+        'Voting_MAE_norm',...
+        'Voting_RMSE_phys',...
+        'Voting_MAE_phys',...
+        'Stacking_R2',...
+        'Stacking_RMSE_norm',...
+        'Stacking_MAE_norm',...
+        'Stacking_RMSE_phys',...
+        'Stacking_MAE_phys'});
+
+    EnsembleMetricTable = [EnsembleMetricTable;row];
+
+end
+
+
+%% ========================================================================
+% 37. SOBOL TABLE
+% ========================================================================
+
+SobolTable = table();
+
+for out = 1:n_outputs
+
+    for feature = 1:n_inputs
+
+        row = table(...
+            string(output_names{out}),...
+            string(input_names{feature}),...
+            Sobol_S1(out,feature),...
+            Sobol_ST(out,feature),...
+            'VariableNames',{...
+            'Output',...
+            'Input',...
+            'FirstOrder_Si',...
+            'TotalOrder_STi'});
+
+        SobolTable = [SobolTable;row];
+
+    end
+
+end
+
+
+%% ========================================================================
+% 38. SHAP SUMMARY TABLE
+% ========================================================================
+
+SHAPSummaryTable = table();
+
+for out = 1:n_outputs
+
+    phi = SHAP_values{out};
+
+    for feature = 1:n_inputs
+
+        row = table(...
+            string(output_names{out}),...
+            string(input_names{feature}),...
+            mean(abs(phi(:,feature))),...
+            mean(phi(:,feature)),...
+            median(phi(:,feature)),...
+            'VariableNames',{...
+            'Output',...
+            'Input',...
+            'MeanAbsSHAP',...
+            'MeanSHAP',...
+            'MedianSHAP'});
+
+        SHAPSummaryTable = [SHAPSummaryTable;row];
+
+    end
+
+end
+
+
+%% ========================================================================
+% 39. GPR UNCERTAINTY TABLE
+% ========================================================================
+
+GPRUncertaintyTable = table();
+
+for out = 1:n_outputs
+
+    row = table(...
+        string(output_names{out}),...
+        GPR_Uncertainty(out).coverage,...
+        GPR_Uncertainty(out).PI_width_norm,...
+        GPR_Uncertainty(out).PI_width_phys,...
+        'VariableNames',{...
+        'Output',...
+        'Coverage95',...
+        'MeanPIWidth_norm',...
+        'MeanPIWidth_phys'});
+
+    GPRUncertaintyTable = [GPRUncertaintyTable;row];
+
+end
+
+
+%% ========================================================================
+% 40. STACKING COEFFICIENT TABLE
+% ========================================================================
+
+StackingCoefficientTable = table();
+
+for out = 1:n_outputs
+
+    row = table(...
+        string(output_names{out}),...
+        Stacking_Beta(1,out),...
+        Stacking_Beta(2,out),...
+        Stacking_Beta(3,out),...
+        Stacking_Bias(out),...
+        'VariableNames',{...
+        'Output',...
+        'RF_Coefficient',...
+        'SVR_Coefficient',...
+        'GPR_Coefficient',...
+        'Bias'});
+
+    StackingCoefficientTable = [StackingCoefficientTable;row];
+
+end
+
+
+%% ========================================================================
+% 41. DISPLAY IMPORTANT TABLES
+% ========================================================================
+
+fprintf('\nBASE MODEL METRICS:\n');
+disp(BaseMetricTable);
+
+fprintf('\nENSEMBLE METRICS:\n');
+disp(EnsembleMetricTable);
+
+fprintf('\nVOTING WEIGHTS:\n');
+
+VotingWeightTable = array2table(...
+    VotingWeights,...
+    'VariableNames',{'RF','SVR','GPR'});
+
+VotingWeightTable.Output = string(output_names(:));
+
+VotingWeightTable = movevars(...
+    VotingWeightTable,...
+    'Output','Before',1);
+
+disp(VotingWeightTable);
+
+fprintf('\nSTACKING COEFFICIENTS:\n');
+disp(StackingCoefficientTable);
+
+fprintf('\nSOBOL INDICES:\n');
+disp(SobolTable);
+
+fprintf('\nSHAP SUMMARY:\n');
+disp(SHAPSummaryTable);
+
+fprintf('\nGPR UNCERTAINTY:\n');
+disp(GPRUncertaintyTable);
+
+
+%% ========================================================================
+% 42. SAVE TABLES TO EXCEL
+% ========================================================================
+
+excel_output = fullfile(...
+    results_folder,...
+    'ML_Reviewer_Analysis_Tables.xlsx');
+
+try
+
+    writetable(BaseMetricTable,...
+        excel_output,...
+        'Sheet','Base_Model_Metrics');
+
+    writetable(EnsembleMetricTable,...
+        excel_output,...
+        'Sheet','Ensemble_Metrics');
+
+    writetable(VotingWeightTable,...
+        excel_output,...
+        'Sheet','Voting_Weights');
+
+    writetable(StackingCoefficientTable,...
+        excel_output,...
+        'Sheet','Stacking_Coefficients');
+
+    writetable(SobolTable,...
+        excel_output,...
+        'Sheet','Sobol');
+
+    writetable(SHAPSummaryTable,...
+        excel_output,...
+        'Sheet','SHAP');
+
+    writetable(GPRUncertaintyTable,...
+        excel_output,...
+        'Sheet','GPR_Uncertainty');
+
+    writetable(GPR_Hyperparameters,...
+        excel_output,...
+        'Sheet','GPR_Hyperparameters');
+
+    fprintf('\nTables saved to:\n%s\n',excel_output);
+
+catch ME
+
+    fprintf('\nCould not write Excel tables:\n%s\n',ME.message);
+
+end
+
+
+%% ========================================================================
+% 43. SAVE ALL MATLAB RESULTS
+% ========================================================================
+
+mat_output = fullfile(...
+    results_folder,...
+    'ML_Reviewer_Analysis_Results.mat');
+
+save(mat_output,...
+    'X_train_raw','X_val_raw','X_test_raw',...
+    'Y_train_raw','Y_val_raw','Y_test_raw',...
+    'X_train','X_val','X_test',...
+    'Y_train','Y_val','Y_test',...
+    'X_min','X_max','X_range',...
+    'Y_min','Y_max','Y_range',...
+    'RF_models','SVR_models','GPR_models',...
+    'RF_pred_test','SVR_pred_test','GPR_pred_test',...
+    'VotingWeights','Voting_pred_test',...
+    'Stacking_models','Stacking_pred_test',...
+    'Stacking_Beta','Stacking_Bias',...
+    'BaseMetrics','StackingMetrics',...
+    'GPR_Uncertainty','GPR_Calibration',...
+    'SpearmanCorrelation',...
+    'Sobol_S1','Sobol_ST',...
+    'SHAP_values','SHAP_base',...
+    'SHAP_additivity_error',...
+    'SHAP_interactions',...
+    'PDP_results','ICE_results',...
+    'PermutationImportance',...
+    '-v7.3');
+
+fprintf('\nMAT results saved to:\n%s\n',mat_output);
+
+
+%% ========================================================================
+% 44. FINAL SUMMARY
+% ========================================================================
+
+fprintf('\n');
+fprintf('============================================================\n');
+fprintf(' ANALYSIS COMPLETED\n');
+fprintf('============================================================\n');
+
+fprintf('\nMain figures generated:\n');
+
+fprintf('  Figure 2  - Base/ensemble test performance\n');
+fprintf('  Figure 3  - Sobol first/total-order sensitivity\n');
+fprintf('  Figure 4  - Exact signed SHAP\n');
+fprintf('  Figure 5  - PDP + ICE overview\n');
+fprintf('  Figure 6  - SHAP interaction\n');
+fprintf('  Figure 7  - GPR uncertainty\n');
+
+if ~isempty(X_opt_normalized)
+    fprintf('  Figure 8  - Optimization uncertainty\n');
+end
+
+fprintf('\nSupplementary figures generated:\n');
+fprintf('  S1-S3     - Actual vs predicted\n');
+fprintf('  S4        - Detailed PDP\n');
+fprintf('  S5        - Detailed ICE\n');
+fprintf('  S6        - SHAP dependence\n');
+fprintf('  S7        - SHAP interaction detail\n');
+fprintf('  S8        - GPR calibration\n');
+fprintf('  S9        - RF permutation importance\n');
+
+fprintf('\nOutput directory:\n%s\n',results_folder);
+
+fprintf('\n============================================================\n');
+fprintf(' IMPORTANT INTERPRETATION NOTES\n');
+fprintf('============================================================\n');
+
+fprintf(['1. Sobol indices assume independently distributed U(0,1) ',...
+         'inputs.\n']);
+
+fprintf(['2. Strong empirical input correlations should therefore be ',...
+         'acknowledged when interpreting Sobol results.\n']);
+
+fprintf(['3. PDPs describe the surrogate-model response and do NOT ',...
+         'establish causality or kinetic constants.\n']);
+
+fprintf(['4. ICE curves represent model-based conditional trajectories ',...
+         'and can contain extrapolation when input combinations are ',...
+         'poorly represented in the training data.\n']);
+
+fprintf(['5. Negative ICE predictions are NOT clipped. They are ',...
+         'reported as a diagnostic of surrogate extrapolation/model ',...
+         'behavior.\n']);
+
+fprintf(['6. SHAP values are exact for the specified background ',...
+         'distribution because all 2^3 feature subsets are evaluated.\n']);
+
+fprintf(['7. Stacking uses out-of-fold predictions to prevent ',...
+         'information leakage.\n']);
+
+fprintf(['8. GPR uncertainty is evaluated on the independent test set ',...
+         'using empirical coverage and prediction-interval width.\n']);
+
+fprintf('\n============================================================\n');
+fprintf(' DONE\n');
+fprintf('============================================================\n');
+
+
+%% ========================================================================
+% LOCAL FUNCTIONS
+% ========================================================================
+
+function idx = subset_to_index(S)
+
+    % Convert logical subset representation to 1-based decimal index.
+    %
+    % Example for 3 features:
+    %
+    % [0 0 0] -> 1
+    % [1 0 0] -> 2
+    % [0 1 0] -> 3
+    % ...
+    % [1 1 1] -> 8
+
+    decimal_value = 0;
+
+    for k = 1:numel(S)
+
+        if S(k)
+            decimal_value = decimal_value + 2^(k-1);
+        end
+
+    end
+
+    idx = decimal_value + 1;
+
+end
+
+
+function name = sanitize_filename(name)
+
+    name = regexprep(name,'[^a-zA-Z0-9_]','_');
+
+    % Prevent excessively long names
+    if length(name) > 80
+        name = name(1:80);
+    end
+
+end
+
+
+function save_myfig(fig_handle,filename)
+
+    % Create output directory if needed
+
+    output_dir = 'ML_Reviewer_Analysis';
+
+    if ~exist(output_dir,'dir')
+        mkdir(output_dir);
+    end
+
+    % PNG
+    exportgraphics(...
+        fig_handle,...
+        fullfile(output_dir,[filename,'.png']),...
+        'Resolution',300);
+
+    % PDF
+    try
+
+        exportgraphics(...
+            fig_handle,...
+            fullfile(output_dir,[filename,'.pdf']),...
+            'ContentType','vector');
+
+    catch
+
+        fprintf('Vector PDF export failed for %s.\n',filename);
+
+    end
+
+end
